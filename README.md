@@ -31,19 +31,19 @@ chmod +x INSTALL.command
 Fast bounded pass:
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode fast --budget 90 --live-root
+remix analyze --package targetpackage --serial emulator-5554 --mode fast --budget 90 --live-root
 ```
 
 Full correlated pass, still bounded:
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode full --budget 240 --jobs 4 --live-root --focus auth,jni,tls,integrity --ghidra-top 8
+remix analyze --package targetpackage--serial emulator-5554 --mode full --budget 240 --jobs 4 --live-root --focus auth,jni,tls,integrity --ghidra-top 8
 ```
 
 Explicit instrumented pass (kept separate from the root baseline):
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode full --budget 300 --live-root --instrument --instrument-duration 18 --frida-prefer stock --focus auth,jni,tls
+remix analyze --package targetpackage --serial emulator-5554 --mode full --budget 300 --live-root --instrument --instrument-duration 18 --frida-prefer stock --focus auth,jni,tls
 ```
 
 ## Manual function workflow
