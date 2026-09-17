@@ -1,10 +1,12 @@
 name: Bootstrap REMIX source
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 permissions:
   contents: write
 jobs:
   bootstrap:
+    if: ${{ !contains(github.event.head_commit.message, 'REMIX bootstrap generated source') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
