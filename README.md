@@ -57,30 +57,96 @@ remix trace --case ~/AndroidCTFMax/cases-remix/CASE --serial emulator-5554 --dur
 remix diff --left ~/AndroidCTFMax/cases-remix/CASE_A --right ~/AndroidCTFMax/cases-remix/CASE_B --verbose
 ```
 
-A `fn` dossier includes static address and module-relative offset, recovered symbols, callers/callees, strings, imports/PLT-GOT relationships, static/dynamic JNI mappings, ARM64 instruction profile, runtime hits/backtraces, targeted Rizin pseudocode/disassembly, and optional Ghidra consensus evidence.
+A `fn` dossier includes:
+
+- static address and module-relative offset;
+- recovered function/symbol names;
+- callers and callees;
+- referenced strings and semantic tags;
+- imported functions reached through PLT/GOT/import xrefs;
+- static/dynamic JNI mappings;
+- targeted ARM64 instruction profile (direct/indirect calls, branches, PAC/AUT, BTI, SVC, ADRP, loads/stores, compares);
+- correlated runtime hits and backtraces;
+- targeted Rizin pseudocode/disassembly;
+- optional Ghidra consensus evidence.
 
 ## Performance model
 
-- `fast`: bulk native index, DEX strings, root runtime map; no default pseudocode.
+REMIX has four modes:
+
+- `fast`: `aa` bulk native index, DEX strings, root runtime map; no default pseudocode.
 - `balanced`: fast index plus six high-value targeted function dossiers.
 - `full`: deeper Rizin analysis + JADX semantic source index + sixteen targeted dossiers.
-- `deep`: deeper analysis + thirty-two targeted dossiers.
+- `deep`: deeper analysis + thirty-two targeted dossiers; intended for bounded hard cases.
 
-`--budget N` is a hard overall wall-clock budget. Native analysis is cached by SHA-256 + REMIX version + analysis mode under `~/.cache/remix/`.
+`--budget N` is a hard overall wall-clock budget. Per-stage timeouts are clamped to the remaining total budget. Expensive engines stop rather than silently running forever.
+
+Native analysis is cached by SHA-256 + REMIX version + analysis mode under `~/.cache/remix/`. Repeating an unchanged APK/ELF therefore avoids re-running bulk Rizin analysis.
+
+## Evidence model
+
+Each native function is normalized into one record with:
+
+```text
+module
+address
+module-relative offset
+name / symbols
+size
+callers / callees
+string xrefs
+imports / PLT-GOT relationships
+JNI mappings
+semantic tags + score
+ARM64 profile
+dynamic observations
+pseudocode / disassembly
+source evidence + confidence
+```
+
+Semantic categories currently include `jni`, `loader`, `tls`, `network`, `crypto`, `integrity`, `antidebug`, `root`, `ipc`, `storage`, `auth`, and `camera`.
+
+The score is a ranking aid, not a claim that a function implements a behavior. Dynamic observations carry higher weight; symbol/import/string-derived tags remain evidence with lower confidence.
 
 ## Case artifacts
 
-Each case contains `REPORT.md`, `case.json`, `case.sqlite`, `functions.jsonl`, `topology.dot`, `artifact/`, optional `java/`, `live-root/`, and `live-frida/`.
+Each case contains:
+
+```text
+REPORT.md          human-readable ranked report
+case.json          complete normalized model
+case.sqlite        queryable functions/strings/imports/JNI/edges
+functions.jsonl    one function dossier per line
+topology.dot       call/JNI graph
+artifact/          APK/DEX/native inputs
+java/              JADX output when enabled
+live-root/         non-instrumented process snapshot
+live-frida/        explicitly instrumented events
+```
+
+Example SQLite query:
+
+```bash
+sqlite3 case.sqlite '
+select module, printf("0x%x",offset), name, score, tags
+from functions
+where tags like "%tls%" or tags like "%auth%"
+order by score desc
+limit 40;
+'
+```
 
 ## Runtime tracing
 
-`remix trace` uses `/proc/<pid>/maps` to translate runtime return addresses/function pointers into module-relative offsets and back into the static function index. The built-in Frida capture engine uses the matching Python environments under `~/AndroidCTFMax/venvs/frida-*` rather than whichever global `frida` happens to be first in `PATH`.
+`remix trace` does not emit orphan ASLR pointers. It first uses the case's `/proc/<pid>/maps` module bases, then translates runtime return addresses/function pointers into module-relative offsets and back into the static function index.
+
+The built-in Frida capture engine observes selected imports/exports, module loading and `RegisterNatives`. It uses the Frida Python environments already present under `~/AndroidCTFMax/venvs/frida-*`, rather than assuming whichever global `frida` happens to be first in `PATH`.
 
 Instrumentation is explicit because some targets detect Frida/Gadget/ptrace/thread/listener artifacts. A root-only baseline should remain authoritative for clean-process claims.
 
 ## Ghidra headless
 
-`--ghidra-top N` runs the shipped `RemixFunctionDossier.java` only for the top-ranked offsets after Rizin/JNI/string/import correlation.
+`--ghidra-top N` runs the shipped `RemixFunctionDossier.java` only for the top-ranked offsets after Rizin/JNI/string/import correlation. It does not headlessly decompile every function in every library. Ghidra's headless analyzer is therefore a targeted independent confirmation engine rather than the primary bottleneck.
 
 ## CI
 
