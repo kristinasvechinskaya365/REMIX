@@ -1,0 +1,26 @@
+name: REMIX CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax
+        run: python -m compileall -q remix tests
+      - name: Unit tests
+        run: python -m unittest discover -v tests
+      - name: CLI smoke
+        run: |
+          python -m remix --version
+          python -m remix --help
