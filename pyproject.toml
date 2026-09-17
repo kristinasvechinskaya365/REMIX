@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remix-re"
-version = "2.0.0"
+version = "2.1.0"
 description = "Correlated Android/ARM64 reverse-engineering engine"
 requires-python = ">=3.11"
 authors = [{name="REMIX CTF Lab"}]

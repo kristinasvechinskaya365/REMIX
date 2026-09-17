@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .categories import classify, score_tags
-from .model import AnalysisCase, Evidence, FunctionNode, JNIMapping, ModuleAnalysis
+from .model import AnalysisCase, DynamicModule, Evidence, FunctionNode, JNIMapping, ModuleAnalysis
 
 
 def parse_addr(v: Any) -> int | None:
@@ -92,6 +92,20 @@ class Correlator:
         return (sm, fn) if fn else None
 
     def _dynamic_events(self) -> None:
+        # Merge Frida's module inventory with the clean root snapshot. This is needed
+        # for libraries loaded after the baseline /proc/maps capture.
+        dyn = {m.name: m for m in self.case.dynamic_modules}
+        for ev in self.case.dynamic_events:
+            if ev.get("event") != "module": continue
+            try:
+                base = parse_addr(ev.get("base")); size = int(ev.get("size") or 0)
+                if base is not None:
+                    dyn[ev.get("name") or ""] = DynamicModule(ev.get("name") or "", ev.get("path") or "", base, base + size, "frida")
+            except Exception:
+                pass
+        self.case.dynamic_modules = [m for k,m in dyn.items() if k]
+        self.dynamic = {m.name: m for m in self.case.dynamic_modules}
+
         for ev in self.case.dynamic_events:
             kind = ev.get("event")
             if kind == "module":
@@ -107,7 +121,7 @@ class Correlator:
                     off = (fnptr - base) if base is not None else None
                     static_addr = ((sm.image_base + off) if sm and off is not None and sm.image_base else off)
                     fn = sm.function_by_addr(static_addr) if sm and static_addr is not None else None
-                    j = JNIMapping("<RegisterNatives>", meth.get("name", ""), meth.get("signature", ""),
+                    j = JNIMapping(ev.get("class") or "<RegisterNatives>", meth.get("name", ""), meth.get("signature", ""),
                                    modname, native_address=static_addr, native_offset=off,
                                    source="frida-register-natives", confidence=1.0)
                     if sm:
@@ -184,6 +198,21 @@ class Correlator:
                         "from": f.address, "from_hex": hex(f.address), "from_name": f.name,
                         "to": dst, "to_hex": hex(dst), "to_name": d.name if d else "",
                     })
+                for xr in f.xrefs_from:
+                    # Preserve non-call references too: strings, data tables, GOT slots,
+                    # function pointers and code jumps are often the decisive topology
+                    # in stripped ARM64 binaries. Calls are already emitted above.
+                    typ = str(xr.get("type", ""))
+                    if xr.get("to_function") == f.address and xr.get("from_function") == f.address:
+                        continue
+                    edges.append({
+                        "kind": "xref", "module": m.name,
+                        "from": f.address, "from_hex": hex(f.address), "from_name": f.name,
+                        "to": xr.get("to"), "to_hex": xr.get("to_hex", ""),
+                        "xref_type": typ, "to_function_name": xr.get("to_function_name", ""),
+                        "to_symbol": xr.get("to_symbol", ""), "to_import": xr.get("to_import", ""),
+                        "to_string": xr.get("to_string", ""),
+                    })
                 for imp in f.imports:
                     edges.append({"kind": "import-call", "module": m.name, "from": f.address,
                                   "from_hex": hex(f.address), "from_name": f.name, "to_name": imp})
@@ -202,6 +231,8 @@ class Correlator:
                 if f.score > 0:
                     ranked.append((f.score, m.name, f.offset, f.name, list(f.tags)))
         ranked.sort(reverse=True)
+        flows = self._semantic_flows()
+        mechanisms = self._mechanisms()
         self.case.summary = {
             "modules": len(self.case.modules),
             "functions": sum(len(m.functions) for m in self.case.modules),
@@ -211,11 +242,64 @@ class Correlator:
             "jni_mappings": sum(len(m.jni) for m in self.case.modules),
             "dynamic_events": len(self.case.dynamic_events),
             "tag_counts": dict(sorted(tag_counts.items())),
+            "semantic_flows": flows,
+            "mechanisms": mechanisms,
+            "xref_edges": sum(len(f.xrefs_from) for m in self.case.modules for f in m.functions),
+            "constructors": sum(len(m.metadata.get("constructors") or []) for m in self.case.modules),
+            "destructors": sum(len(m.metadata.get("destructors") or []) for m in self.case.modules),
+            "pltgot_relocations": sum(len(m.metadata.get("pltgot_relocations") or []) for m in self.case.modules),
+            "cxx_type_objects": sum(len(m.metadata.get("cxx_type_topology") or []) for m in self.case.modules),
             "top_functions": [
                 {"score": round(sc, 2), "module": mod, "offset": off, "offset_hex": hex(off), "name": name, "tags": tags}
                 for sc, mod, off, name, tags in ranked[:100]
             ],
         }
+
+    def _semantic_flows(self) -> dict[str, dict]:
+        """Summarize category-local call topology without pretending it proves semantics."""
+        interesting = {"auth","tls","network","crypto","integrity","jni","loader","antidebug","ipc","storage","camera","root"}
+        out: dict[str, dict] = {}
+        for tag in sorted(interesting):
+            rows = []
+            for m in self.case.modules:
+                tagged = {f.address: f for f in m.functions if tag in f.tags}
+                if not tagged:
+                    continue
+                for f in tagged.values():
+                    incoming = sum(1 for a in f.callers if a in tagged)
+                    outgoing = sum(1 for a in f.callees if a in tagged)
+                    cross = sorted({t for a in f.callees for t in (set((m.function_by_addr(a).tags)) if m.function_by_addr(a) else set()) if t != tag})
+                    rows.append({"module":m.name,"offset":f.offset,"offset_hex":hex(f.offset),"name":f.name,
+                                 "score":round(f.score,2),"incoming":incoming,"outgoing":outgoing,"cross_tags":cross})
+            if not rows:
+                continue
+            roots = sorted((r for r in rows if r["incoming"] == 0), key=lambda r:(-r["score"],-r["outgoing"]))[:12]
+            hubs = sorted(rows, key=lambda r:(-(r["incoming"]+r["outgoing"]),-r["score"]))[:12]
+            sinks = sorted((r for r in rows if r["outgoing"] == 0), key=lambda r:(-r["score"],-r["incoming"]))[:12]
+            out[tag] = {"functions":len(rows),"roots":roots,"hubs":hubs,"sinks":sinks}
+        return out
+
+    def _mechanisms(self) -> dict[str, list[dict]]:
+        """Fingerprint implementation mechanisms from independent static evidence."""
+        rules = {
+            "jni_registration": {"RegisterNatives","JNI_OnLoad"},
+            "dynamic_loader": {"dlopen","android_dlopen_ext","dlsym","mmap","mprotect"},
+            "posix_network": {"connect","socket","send","sendto","recv","recvfrom","getaddrinfo"},
+            "native_tls": {"SSL_read","SSL_write","SSL_do_handshake","SSL_set_custom_verify","X509_verify_cert"},
+            "anti_debug": {"ptrace","prctl","syscall"},
+            "filesystem_state": {"open","openat","read","write","rename","unlink","stat"},
+        }
+        out: dict[str, list[dict]] = {}
+        for mech, needles in rules.items():
+            hits=[]
+            for m in self.case.modules:
+                names={i.name for i in m.imports}
+                matched=sorted(n for n in names if any(n == x or n.startswith(x+"@@") for x in needles))
+                if matched:
+                    refs=sorted({hex(a) for i in m.imports if i.name in matched for a in i.refs_from})
+                    hits.append({"module":m.name,"imports":matched,"ref_functions":refs[:100]})
+            if hits: out[mech]=hits
+        return out
 
     def ranked_functions(self, *, tags: set[str] | None = None, limit: int = 50) -> list[tuple[ModuleAnalysis, FunctionNode]]:
         rows = []

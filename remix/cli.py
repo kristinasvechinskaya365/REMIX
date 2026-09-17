@@ -61,6 +61,23 @@ def choose_native_libs(paths: list[str], all_abis: bool) -> list[str]:
     return arm64 or paths
 
 
+def parse_offset_hooks(specs: list[str] | None) -> list[dict]:
+    out=[]
+    for spec in specs or []:
+        # MODULE@0xOFFSET[:label]
+        if "@" not in spec:
+            raise SystemExit(f"bad --offset hook {spec!r}; expected MODULE@0xOFFSET[:label]")
+        module, rest=spec.split("@",1)
+        label=""
+        if ":" in rest:
+            off_s,label=rest.split(":",1)
+        else:
+            off_s=rest
+        off=int(off_s,0)
+        out.append({"module":module,"offset":hex(off),"label":label or f"{module}+{off:#x}"})
+    return out
+
+
 def analyze_module(path: str, *, budget: Budget, deep: bool, cache: ModuleCache, no_cache: bool) -> ModuleAnalysis:
     digest = sha256_file(path)
     mode = "deep" if deep else "fast"
@@ -172,18 +189,31 @@ def cmd_analyze(args) -> int:
     if args.package and args.live_root:
         try:
             case.dynamic_modules = android.root_snapshot(args.package, case_dir, launch=not args.no_launch)
-            print(f"[OK] root-live modules={len(case.dynamic_modules)}")
+            anomaly_file = case_dir / "live-root" / "memory_anomalies.json"
+            if anomaly_file.exists() and case.artifact:
+                try: case.artifact.metadata["runtime_memory_anomalies"] = json.loads(anomaly_file.read_text())
+                except Exception: pass
+            print(f"[OK] root-live modules={len(case.dynamic_modules)} anomalies={len(case.artifact.metadata.get('runtime_memory_anomalies', [])) if case.artifact else 0}")
         except Exception as e:
             case.warnings.append(f"root snapshot: {e}")
 
     # Phase 6: explicit instrumentation, never silently mixed with baseline evidence.
+    # Correlate static evidence first so --trace-top hooks exact ranked offsets instead
+    # of spraying generic hooks across every function.
+    preliminary = Correlator(case)
+    preliminary.run()
     if args.package and args.instrument:
         try:
+            offset_hooks = parse_offset_hooks(args.offset_hook)
+            if args.trace_top > 0:
+                focus_tags=set(x for x in args.focus.split(",") if x) if args.focus else None
+                for m, fn in preliminary.ranked_functions(tags=focus_tags, limit=args.trace_top):
+                    offset_hooks.append({"module":m.name,"offset":hex(fn.offset),"label":f"rank:{fn.name}"})
             fr = FridaEngine(budget=budget)
             evfile = fr.capture(args.package, case_dir, duration=args.instrument_duration,
                                 endpoint=args.frida_endpoint, spawn=args.spawn,
-                                prefer=args.frida_prefer,
-                                patterns=args.hook if args.hook else None)
+                                prefer=args.frida_prefer, patterns=args.hook if args.hook else None,
+                                offset_hooks=offset_hooks)
             if evfile:
                 case.dynamic_events = fr.read_events(evfile)
                 print(f"[OK] instrument events={len(case.dynamic_events)}")
@@ -358,6 +388,138 @@ def cmd_graph(args) -> int:
     return 0
 
 
+def cmd_module(args) -> int:
+    case = load_case(args.case)
+    m = _select_module(case, args.module)
+    payload = {
+        "name": m.name, "path": m.path, "sha256": m.sha256, "arch": m.arch, "bits": m.bits,
+        "image_base": m.image_base, "image_base_hex": hex(m.image_base), "entry": m.entry,
+        "functions": len(m.functions), "strings": len(m.strings), "imports": len(m.imports),
+        "symbols": len(m.symbols), "jni": len(m.jni), "metadata": m.metadata, "errors": m.errors,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True)); return 0
+    print(f"{m.name} sha256={m.sha256} arch={m.arch}/{m.bits} base={m.image_base:#x} entry={m.entry:#x}")
+    print(f"functions={len(m.functions)} strings={len(m.strings)} imports={len(m.imports)} symbols={len(m.symbols)} jni={len(m.jni)}")
+    sec = m.metadata.get("security") or {}
+    print(f"PIE={sec.get('pie')} RELRO={sec.get('relro_segment')} NX_STACK={sec.get('nx_stack')} RWX={sec.get('rwx_segment_count')}")
+    print("DT_NEEDED=" + ",".join(m.metadata.get("libraries") or []))
+    for key in ("constructors","destructors","pltgot_relocations","cxx_type_topology","native_anchors"):
+        rows=m.metadata.get(key) or []
+        print(f"{key}={len(rows)}")
+        for row in rows[:args.limit]: print("  " + json.dumps(row, sort_keys=True))
+    return 0
+
+
+def cmd_refs(args) -> int:
+    case = load_case(args.case); m = _select_module(case, args.module); fn = _find_fn(m, args)
+    rows=[]
+    if args.direction in {"out","both"}:
+        rows += [("OUT", x) for x in fn.xrefs_from]
+    if args.direction in {"in","both"}:
+        rows += [("IN", x) for x in fn.xrefs_to]
+    needle=(args.contains or "").lower()
+    typ=(args.type or "").upper()
+    shown=0
+    for direction, x in rows:
+        if typ and typ not in str(x.get("type", "")).upper(): continue
+        hay=" ".join(str(x.get(k, "")) for k in ("type","to_hex","to_function_name","to_symbol","to_import","to_string")).lower()
+        if needle and needle not in hay: continue
+        print(f"{direction:3} {x.get('from_hex','')} -> {x.get('to_hex','')} type={x.get('type','')} fn={x.get('to_function_name','')} sym={x.get('to_symbol','')} imp={x.get('to_import','')} str={x.get('to_string','')[:160]}")
+        shown += 1
+        if shown >= args.limit: break
+    print(f"shown={shown} total_in={len(fn.xrefs_to)} total_out={len(fn.xrefs_from)}")
+    return 0
+
+
+def cmd_symbols(args) -> int:
+    case=load_case(args.case); modules=[_select_module(case,args.module)] if args.module else case.modules
+    rows=[]; needle=(args.contains or "").lower(); tags=set(args.tag or [])
+    for m in modules:
+        for sy in m.symbols:
+            if needle and needle not in (sy.name+" "+sy.demangled).lower(): continue
+            if args.imported and not sy.imported: continue
+            if args.exported and not sy.exported: continue
+            if args.type and args.type.lower() not in sy.type.lower(): continue
+            if tags and not (tags & set(sy.tags)): continue
+            rows.append((m,sy))
+    rows.sort(key=lambda ms:(ms[0].name, ms[1].address, ms[1].name))
+    for m,sy in rows[:args.limit]:
+        print(f"{m.name} {sy.address:#x} size={sy.size:<6} {sy.bind}/{sy.type}/{sy.visibility} {'I' if sy.imported else '-'}{'E' if sy.exported else '-'} {sy.name} {sy.demangled} [{','.join(sy.tags)}]")
+    print(f"matches={len(rows)}")
+    return 0
+
+
+def cmd_strings(args) -> int:
+    case=load_case(args.case); modules=[_select_module(case,args.module)] if args.module else case.modules
+    needle=(args.contains or "").lower(); tags=set(args.tag or []); rows=[]
+    for m in modules:
+        by={f.address:f for f in m.functions}
+        for st in m.strings:
+            if needle and needle not in st.value.lower(): continue
+            if tags and not (tags & set(st.tags)): continue
+            rows.append((m,st,by))
+    rows.sort(key=lambda x:(x[0].name,x[1].address))
+    for m,st,by in rows[:args.limit]:
+        refs=""
+        if args.with_refs:
+            refs=" refs="+",".join(f"{by[a].offset:#x}:{by[a].name}" if a in by else hex(a) for a in st.refs_from[:20])
+        print(f"{m.name} {st.address:#x} [{','.join(st.tags)}] {st.value[:500]}{refs}")
+    print(f"matches={len(rows)}")
+    return 0
+
+
+def cmd_jni(args) -> int:
+    case=load_case(args.case); modules=[_select_module(case,args.module)] if args.module else case.modules
+    needle=(args.contains or "").lower(); rows=[]
+    for m in modules:
+        for j in m.jni:
+            hay=f"{j.java_class} {j.java_method} {j.signature} {j.native_symbol} {j.source}".lower()
+            if needle and needle not in hay: continue
+            rows.append((m,j))
+    rows.sort(key=lambda mj:(mj[0].name,mj[1].native_offset if mj[1].native_offset is not None else -1,mj[1].java_method))
+    for m,j in rows[:args.limit]:
+        off="?" if j.native_offset is None else hex(j.native_offset)
+        addr="?" if j.native_address is None else hex(j.native_address)
+        print(f"{m.name}+{off} addr={addr} {j.java_fqmn} symbol={j.native_symbol} source={j.source} confidence={j.confidence:.2f}")
+    print(f"matches={len(rows)}")
+    return 0
+
+
+def _find_by_spec(m: ModuleAnalysis, spec: str) -> FunctionNode:
+    if spec.startswith("0x") or spec.isdigit():
+        n=int(spec,0); fn=m.function_by_offset(n) or m.function_by_addr(n)
+        if fn: return fn
+    hits=[f for f in m.functions if spec.lower() in f.name.lower() or any(spec.lower() in x.lower() for x in f.symbols)]
+    if not hits: raise SystemExit(f"function not found: {spec}")
+    return sorted(hits,key=lambda f:-f.score)[0]
+
+
+def cmd_path(args) -> int:
+    case=load_case(args.case); m=_select_module(case,args.module)
+    src=_find_by_spec(m,args.from_fn); dst=_find_by_spec(m,args.to_fn)
+    by={f.address:f for f in m.functions}; queue=[src.address]; prev={src.address:None}
+    while queue:
+        cur=queue.pop(0)
+        if cur==dst.address: break
+        fn=by.get(cur)
+        if not fn: continue
+        for nxt in fn.callees:
+            if nxt in by and nxt not in prev:
+                prev[nxt]=cur; queue.append(nxt)
+                if len(prev) > args.max_nodes: break
+    if dst.address not in prev:
+        print("NO_CALL_PATH"); return 1
+    chain=[]; cur=dst.address
+    while cur is not None:
+        chain.append(cur); cur=prev[cur]
+    chain.reverse()
+    for i,a in enumerate(chain):
+        f=by[a]; print(f"{i:02d} {m.name}+{f.offset:#x} {f.name} [{','.join(f.tags)}]")
+    print(f"hops={len(chain)-1}")
+    return 0
+
+
 def cmd_trace(args) -> int:
     if args.case:
         case = load_case(args.case)
@@ -391,7 +553,8 @@ def cmd_trace(args) -> int:
         case.warnings.append(f"pre-trace root snapshot: {e}")
     fr = FridaEngine(budget=budget)
     evfile = fr.capture(package, case.case_dir, duration=args.duration, endpoint=args.frida_endpoint,
-                        spawn=args.spawn, prefer=args.frida_prefer, patterns=args.hook or None)
+                        spawn=args.spawn, prefer=args.frida_prefer, patterns=args.hook or None,
+                        offset_hooks=parse_offset_hooks(args.offset_hook))
     if not evfile:
         raise SystemExit("no usable Frida Python environment/route")
     case.dynamic_events = fr.read_events(evfile)
@@ -449,6 +612,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--instrument-duration", type=int, default=18); a.add_argument("--frida-endpoint")
     a.add_argument("--frida-prefer", choices=["stock", "phantom", "florida"], default="stock"); a.add_argument("--spawn", action="store_true")
     a.add_argument("--hook", action="append", help="runtime import/export symbol to observe; repeatable")
+    a.add_argument("--offset-hook", action="append", help="exact runtime hook MODULE@0xOFFSET[:label]; repeatable")
+    a.add_argument("--trace-top", type=int, default=0, help="when --instrument is set, hook top N statically-ranked native functions")
     a.add_argument("--ghidra-top", type=int, default=0, help="second-opinion headless decompile for top N ranked functions")
     a.add_argument("--ghidra-timeout", type=int, default=150)
     a.set_defaults(func=cmd_analyze)
@@ -467,11 +632,33 @@ def build_parser() -> argparse.ArgumentParser:
     s = g.add_mutually_exclusive_group(required=True); s.add_argument("--offset"); s.add_argument("--address"); s.add_argument("--symbol")
     g.add_argument("--depth", type=int, default=2); g.add_argument("--direction", choices=["up", "down", "both"], default="both"); g.set_defaults(func=cmd_graph)
 
+    mo = sub.add_parser("module", help="show loader/security/constructor/PLT/RTTI topology for one ELF")
+    mo.add_argument("--case", required=True); mo.add_argument("--module"); mo.add_argument("--limit", type=int, default=30); mo.add_argument("--json", action="store_true"); mo.set_defaults(func=cmd_module)
+
+    rf = sub.add_parser("refs", help="show incoming/outgoing code/data/string/import xrefs for one function")
+    rf.add_argument("--case", required=True); rf.add_argument("--module")
+    rfg=rf.add_mutually_exclusive_group(required=True); rfg.add_argument("--offset"); rfg.add_argument("--address"); rfg.add_argument("--symbol")
+    rf.add_argument("--direction", choices=["in","out","both"], default="both"); rf.add_argument("--type"); rf.add_argument("--contains"); rf.add_argument("--limit", type=int, default=200); rf.set_defaults(func=cmd_refs)
+
+    sy = sub.add_parser("symbols", help="query native symbols/demangled names/types/visibility")
+    sy.add_argument("--case", required=True); sy.add_argument("--module"); sy.add_argument("--contains"); sy.add_argument("--tag", action="append")
+    sy.add_argument("--imported", action="store_true"); sy.add_argument("--exported", action="store_true"); sy.add_argument("--type"); sy.add_argument("--limit", type=int, default=300); sy.set_defaults(func=cmd_symbols)
+
+    st = sub.add_parser("strings", help="query native strings and their referring functions")
+    st.add_argument("--case", required=True); st.add_argument("--module"); st.add_argument("--contains"); st.add_argument("--tag", action="append"); st.add_argument("--with-refs", action="store_true"); st.add_argument("--limit", type=int, default=300); st.set_defaults(func=cmd_strings)
+
+    jn = sub.add_parser("jni", help="query static and dynamic Java↔native mappings")
+    jn.add_argument("--case", required=True); jn.add_argument("--module"); jn.add_argument("--contains"); jn.add_argument("--limit", type=int, default=300); jn.set_defaults(func=cmd_jni)
+
+    pa = sub.add_parser("path", help="find shortest static call path between two native functions")
+    pa.add_argument("--case", required=True); pa.add_argument("--module"); pa.add_argument("--from", dest="from_fn", required=True); pa.add_argument("--to", dest="to_fn", required=True); pa.add_argument("--max-nodes", type=int, default=100000); pa.set_defaults(func=cmd_path)
+
     t = sub.add_parser("trace", help="correlate runtime RegisterNatives/import calls back to static functions")
     t.add_argument("--case"); t.add_argument("--package"); t.add_argument("--serial", default=os.environ.get("ADB_SERIAL", "emulator-5554"))
     t.add_argument("--out"); t.add_argument("--duration", type=int, default=18); t.add_argument("--budget", type=int, default=120); t.add_argument("--jobs", type=int, default=3)
     t.add_argument("--frida-endpoint"); t.add_argument("--frida-prefer", choices=["stock", "phantom", "florida"], default="stock")
-    t.add_argument("--spawn", action="store_true"); t.add_argument("--no-launch", action="store_true"); t.add_argument("--hook", action="append"); t.set_defaults(func=cmd_trace)
+    t.add_argument("--spawn", action="store_true"); t.add_argument("--no-launch", action="store_true"); t.add_argument("--hook", action="append")
+    t.add_argument("--offset-hook", action="append", help="MODULE@0xOFFSET[:label]; repeatable"); t.set_defaults(func=cmd_trace)
 
     df = sub.add_parser("diff", help="function-level semantic diff between two REMIX cases")
     df.add_argument("--left", required=True); df.add_argument("--right", required=True); df.add_argument("--limit", type=int, default=300); df.add_argument("--verbose", action="store_true"); df.set_defaults(func=cmd_diff)
