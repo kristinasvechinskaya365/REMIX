@@ -19,7 +19,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add README.md LICENSE INSTALL.command VERIFY.command pyproject.toml remix tests ghidra_scripts .github/workflows/ci.yml
+          git add README.md LICENSE INSTALL.command VERIFY.command pyproject.toml remix tests ghidra_scripts
           if git diff --cached --quiet; then
             echo 'No generated source changes.'
             exit 0
