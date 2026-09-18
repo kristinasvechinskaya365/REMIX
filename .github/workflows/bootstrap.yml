@@ -1,10 +1,12 @@
-name: Bootstrap REMIX source
+name: Bootstrap REMIX V3 source
 on:
-  workflow_dispatch:
+  push:
+    branches: [v3-nextlevel]
 permissions:
   contents: write
 jobs:
   bootstrap:
+    if: ${{ !contains(github.event.head_commit.message, 'REMIX V3 generated source') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,14 +15,21 @@ jobs:
           python-version: '3.13'
       - name: Expand source payload
         run: python bootstrap_repo.py
+      - name: Verify source before commit
+        run: |
+          python -m compileall -q remix tests
+          python -m unittest discover -v tests
+          python -m remix --version
+          python -m remix engines >/dev/null
+          python -m remix recipe --list >/dev/null
       - name: Commit generated source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add README.md LICENSE INSTALL.command VERIFY.command pyproject.toml remix tests ghidra_scripts
+          git add README.md INSTALL.command VERIFY.command pyproject.toml remix tests docs examples .github/workflows/ci.yml
           if git diff --cached --quiet; then
             echo 'No generated source changes.'
             exit 0
           fi
-          git commit -m 'REMIX bootstrap generated source'
+          git commit -m 'REMIX V3 generated source'
           git push
