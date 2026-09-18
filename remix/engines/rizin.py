@@ -220,6 +220,7 @@ class RizinEngine:
                 return fn
             return None
 
+        symbol_by_addr = {s.address: s.name for s in m.symbols if s.address}
         for xr in xrefs:
             frm = _num(xr.get("from") or xr.get("from_addr") or xr.get("at"))
             to = _num(xr.get("to") or xr.get("to_addr") or xr.get("addr"))
@@ -228,6 +229,18 @@ class RizinEngine:
             if not src_fn:
                 continue
             dst_fn = containing(to)
+            xrow = {
+                "from": frm, "from_hex": hex(frm), "to": to, "to_hex": hex(to), "type": typ,
+                "from_function": src_fn.address, "from_function_name": src_fn.name,
+                "to_function": dst_fn.address if dst_fn else None,
+                "to_function_name": dst_fn.name if dst_fn else "",
+                "to_symbol": symbol_by_addr.get(to, ""),
+                "to_string": strings_by_addr[to].value[:512] if to in strings_by_addr else "",
+                "to_import": imports_by_addr[to].name if to in imports_by_addr else "",
+            }
+            src_fn.xrefs_from.append(xrow)
+            if dst_fn:
+                dst_fn.xrefs_to.append(xrow)
             if dst_fn and dst_fn.address != src_fn.address and ("CALL" in typ or "CODE" in typ or typ in {"C", "J"}):
                 if dst_fn.address not in src_fn.callees:
                     src_fn.callees.append(dst_fn.address)
@@ -256,6 +269,8 @@ class RizinEngine:
             f.callers.sort()
             f.callees.sort()
             f.string_refs.sort()
+            f.arm64_profile.setdefault("xref_out", len(f.xrefs_from))
+            f.arm64_profile.setdefault("xref_in", len(f.xrefs_to))
 
     def _attach_symbol_names(self, m: ModuleAnalysis) -> None:
         fn_by_addr = {f.address: f for f in m.functions}
@@ -277,6 +292,7 @@ class RizinEngine:
             "disasm": f"pdf @ {fn.address}",
             "pseudocode": f"pdc @ {fn.address}",
             "insns": f"pdj {max(8, min(512, (fn.size // 4) + 4))} @ {fn.address}",
+            "blocks": f"afbj @ {fn.address}",
         }
         for kind, cmd in commands.items():
             rr = run([self.rizin, "-2", "-q", "-e", "scr.color=false", "-A", "-c", cmd, module.path],
@@ -286,6 +302,15 @@ class RizinEngine:
                 fn.disasm = text[-24000:]
             elif kind == "pseudocode":
                 fn.pseudocode = text[-24000:]
+            elif kind == "blocks":
+                rows = _json_from(text, [])
+                if isinstance(rows, list):
+                    edges = 0
+                    for row in rows:
+                        edges += int(bool(row.get("jump"))) + int(bool(row.get("fail")))
+                    blocks = len(rows)
+                    fn.arm64_profile.update({"basic_blocks": blocks, "cfg_edges": edges,
+                                             "cyclomatic_approx": max(1, edges - blocks + 2) if blocks else 0})
             else:
                 rows = _json_from(text, [])
                 if isinstance(rows, list):
@@ -306,4 +331,7 @@ class RizinEngine:
                         elif mn.startswith("ldr") or mn.startswith("ldp"): counts["load"] += 1
                         elif mn.startswith("str") or mn.startswith("stp"): counts["store"] += 1
                         elif mn in {"cmp","cmn","ccmp","tst"}: counts["compare"] += 1
-                    fn.arm64_profile = {"instruction_count": len(rows), **counts}
+                    fn.arm64_profile.update({"instruction_count": len(rows), **counts})
+                    fn.arm64_profile["indirect_control_flow"] = counts["indirect_call"] + counts["branch"]
+                    fn.arm64_profile["has_syscall"] = bool(counts["svc"])
+                    fn.arm64_profile["has_pac_bti"] = bool(counts["pac_aut"] or counts["bti"])

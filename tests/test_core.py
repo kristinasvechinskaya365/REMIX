@@ -53,6 +53,13 @@ class CoreTests(unittest.TestCase):
         self.assertIn("SSL_write", f.imports)
         self.assertIn("auth", f.tags)
         self.assertIn("tls", f.tags)
+        self.assertEqual(len(f.xrefs_from), 3)
+        self.assertTrue(any(x.get("to_string") == "device_secret" for x in f.xrefs_from))
+        case = AnalysisCase("/tmp/case", "x", "fast", "now", modules=[mod])
+        Correlator(case).run()
+        self.assertGreaterEqual(case.summary.get("xref_edges", 0), 3)
+        self.assertIn("auth", case.summary.get("semantic_flows", {}))
+        self.assertIn("native_tls", case.summary.get("mechanisms", {}))
 
     def test_runtime_correlation(self):
         case = AnalysisCase("/tmp/c", "pkg", "fast", "now")

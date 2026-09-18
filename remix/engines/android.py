@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -183,7 +184,28 @@ class AndroidEngine:
             (snap / name).write_text(rr.stdout + ("\nSTDERR:\n" + rr.stderr if rr.stderr else ""), encoding="utf-8", errors="replace")
 
         maps_text = (snap / "maps.txt").read_text(errors="replace")
+        anomalies = self.map_anomalies(maps_text)
+        (snap / "memory_anomalies.json").write_text(json.dumps(anomalies, indent=2, sort_keys=True), encoding="utf-8")
         return self.parse_maps(maps_text)
+
+    @staticmethod
+    def map_anomalies(text: str) -> list[dict]:
+        rows=[]
+        for line in text.splitlines():
+            parts=line.split(None,5)
+            if len(parts) < 5: continue
+            rng,perms,offset,dev,inode=parts[:5]
+            path=parts[5] if len(parts)>5 else ""
+            reasons=[]
+            if "x" in perms and "w" in perms: reasons.append("writable-executable")
+            if "x" in perms and (not path or path.startswith("[") or "memfd:" in path): reasons.append("anonymous-executable")
+            if "(deleted)" in path: reasons.append("deleted-mapping")
+            if "x" in perms and any(x in path for x in ("/data/local/tmp/", "/data/adb/", "/sdcard/")): reasons.append("nonstandard-executable-path")
+            if reasons:
+                try: a,b=(int(x,16) for x in rng.split("-",1))
+                except Exception: a=b=0
+                rows.append({"range":rng,"start":a,"end":b,"size":max(0,b-a),"perms":perms,"offset":offset,"path":path,"reasons":reasons})
+        return rows
 
     @staticmethod
     def parse_maps(text: str) -> list[DynamicModule]:

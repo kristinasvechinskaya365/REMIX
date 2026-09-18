@@ -1,2 +1,2 @@
-from .cli import main
+from .v3cli import main
 raise SystemExit(main())

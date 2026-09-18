@@ -18,12 +18,14 @@ DEFAULT_IMPORT_PATTERNS = [
 ]
 
 
-def build_frida_script(patterns: list[str] | None = None, *, backtrace: bool = True) -> str:
+def build_frida_script(patterns: list[str] | None = None, *, backtrace: bool = True, offset_hooks: list[dict] | None = None) -> str:
     pats = patterns or DEFAULT_IMPORT_PATTERNS
     pats_json = json.dumps(pats)
+    offsets_json = json.dumps(offset_hooks or [])
     bt = "true" if backtrace else "false"
     return r'''"use strict";
 const WANT = new Set(''' + pats_json + r''');
+const OFFSET_HOOKS = ''' + offsets_json + r''';
 const WITH_BT = ''' + bt + r''';
 const hooked = new Set();
 
@@ -34,6 +36,14 @@ function bt(ctx) {
   try { return Thread.backtrace(ctx, Backtracer.ACCURATE).slice(0, 12).map(DebugSymbol.fromAddress).map(String); }
   catch (_) { return []; }
 }
+function globalExport(name) {
+  try {
+    if (Module.findGlobalExportByName) return Module.findGlobalExportByName(name);
+    if (Module.getGlobalExportByName) return Module.getGlobalExportByName(name);
+  } catch (_) {}
+  try { return Module.findExportByName(null, name); } catch (_) {}
+  return null;
+}
 function hookAddress(p, name, moduleName) {
   if (!p || p.isNull()) return;
   const key = p.toString() + ":" + name;
@@ -42,17 +52,36 @@ function hookAddress(p, name, moduleName) {
   try {
     Interceptor.attach(p, {
       onEnter(args) {
-        emit({event:"call", symbol:name, hook_module:moduleName || "", address:addr(p),
+        const av = [];
+        for (let i = 0; i < 8; i++) { try { av.push(addr(args[i])); } catch (_) { av.push("?"); } }
+        this._remix = {symbol:name, module:moduleName || ""};
+        emit({event:"call", symbol:name, hook_module:moduleName || "", address:addr(p), args:av,
               return_address:addr(this.returnAddress), thread_id:this.threadId, backtrace:bt(this.context)});
+      },
+      onLeave(retval) {
+        emit({event:"return", symbol:name, hook_module:moduleName || "", address:addr(p), retval:addr(retval), thread_id:this.threadId});
       }
     });
   } catch (e) { emit({event:"hook-error", symbol:name, address:addr(p), error:String(e)}); }
 }
 function hookGlobal(name) {
   try {
-    const p = Module.findGlobalExportByName ? Module.findGlobalExportByName(name) : null;
+    const p = globalExport(name);
     if (p) hookAddress(p, name, "global");
   } catch (_) {}
+}
+
+function hookOffsets() {
+  for (const h of OFFSET_HOOKS) {
+    try {
+      const m = Process.findModuleByName(h.module);
+      if (!m) continue;
+      const off = ptr(h.offset);
+      const p = m.base.add(off);
+      hookAddress(p, h.label || (h.module + "+" + h.offset), h.module);
+      emit({event:"offset-hook", module:h.module, base:addr(m.base), offset:String(h.offset), address:addr(p), label:h.label || ""});
+    } catch (e) { emit({event:"offset-hook-error", hook:h, error:String(e)}); }
+  }
 }
 
 // Runtime module inventory gives the correlation layer real ASLR bases.
@@ -65,6 +94,7 @@ for (const m of Process.enumerateModules()) {
   } catch (_) {}
 }
 for (const n of WANT) hookGlobal(n);
+hookOffsets();
 
 // Native registration is higher value than guessing JNI_OnLoad tables statically.
 try {
@@ -90,7 +120,9 @@ try {
                        module:mod ? mod.name : "", module_base:mod ? addr(mod.base) : "0x0"});
           } catch (_) {}
         }
-        emit({event:"register-natives", count:count, methods:rows, register_address:addr(s.address)});
+        let cls = "";
+        try { const env = Java.vm.tryGetEnv(); if (env) cls = env.getClassName(args[1]); } catch (_) {}
+        emit({event:"register-natives", class:cls, count:count, methods:rows, register_address:addr(s.address)});
       }
     });
     break;
@@ -101,18 +133,20 @@ try {
 function lateRefresh(path) {
   setTimeout(function () {
     for (const m of Process.enumerateModules()) {
+      emit({event:"module", name:m.name, path:m.path, base:addr(m.base), size:m.size, refresh:true});
       try {
         for (const imp of m.enumerateImports()) {
           if (WANT.has(imp.name) && imp.address) hookAddress(imp.address, imp.name, m.name);
         }
       } catch (_) {}
     }
+    hookOffsets();
     emit({event:"module-refresh", trigger:path || ""});
   }, 25);
 }
 for (const dl of ["dlopen", "android_dlopen_ext"]) {
   try {
-    const p = Module.findGlobalExportByName ? Module.findGlobalExportByName(dl) : null;
+    const p = globalExport(dl);
     if (!p) continue;
     Interceptor.attach(p, {
       onEnter(args) { try { this.path = args[0].isNull() ? "" : args[0].readCString(); } catch (_) { this.path=""; } },
@@ -154,7 +188,7 @@ class FridaEngine:
 
     def capture(self, package: str, case_dir: str | Path, *, duration: float = 20,
                 endpoint: str | None = None, spawn: bool = False, prefer: str = "stock",
-                patterns: list[str] | None = None) -> Path | None:
+                patterns: list[str] | None = None, offset_hooks: list[dict] | None = None) -> Path | None:
         py = self.pick_python(prefer)
         if not py:
             return None
@@ -162,7 +196,7 @@ class FridaEngine:
         live_dir = case_dir / "live-frida"
         live_dir.mkdir(parents=True, exist_ok=True)
         script = live_dir / "correlator.js"
-        script.write_text(build_frida_script(patterns), encoding="utf-8")
+        script.write_text(build_frida_script(patterns, offset_hooks=offset_hooks), encoding="utf-8")
         out = live_dir / "events.jsonl"
         helper = Path(__file__).resolve().parent.parent / "frida_capture.py"
         argv = [str(py), str(helper), "--package", package, "--script", str(script), "--out", str(out),

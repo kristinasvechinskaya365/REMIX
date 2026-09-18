@@ -1,0 +1,13 @@
+{
+  "name": "generic-consensus",
+  "steps": [
+    {"id":"hot","op":"select","where":"score>=5 OR tag:jni OR tag:integrity","limit":40},
+    {"id":"near","op":"expand","from":"hot","direction":"both","depth":1,"limit":120},
+    {"id":"rz","op":"enrich","engine":"rizin","from":"near","limit":30,"continue_on_error":true},
+    {"id":"gh","op":"enrich","engine":"ghidra","from":"hot","limit":10,"timeout":120,"continue_on_error":true},
+    {"id":"checks","op":"validate","from":"hot","engines":["rizin","lief","radare2","ghidra"],"limit":20,"continue_on_error":true},
+    {"id":"vote","op":"consensus","from":"checks","policy":"weighted"},
+    {"id":"strong","op":"filter","from":"vote","criteria":{"score":{"gte":0.70}}},
+    {"id":"out","op":"emit","from":"strong","format":"json"}
+  ]
+}

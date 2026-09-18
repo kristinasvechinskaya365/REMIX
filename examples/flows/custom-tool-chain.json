@@ -1,0 +1,10 @@
+{
+  "name": "custom-tool-chain",
+  "steps": [
+    {"id":"hot","op":"select","where":"score>=6 AND size>24","limit":20},
+    {"id":"objdump","op":"external","from":"hot","foreach":true,"argv":["llvm-objdump","-d","--start-address=${address}","--stop-address=${end}","${module_path}"],"parser":"text","timeout":15,"continue_on_error":true},
+    {"id":"successful","op":"filter","from":"objdump","criteria":{"rc":{"eq":0}}},
+    {"id":"check","op":"assert","from":"successful","min_count":1,"message":"no external disassembly succeeded"},
+    {"id":"out","op":"emit","from":"successful","format":"jsonl"}
+  ]
+}

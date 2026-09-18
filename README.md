@@ -1,173 +1,240 @@
-# REMIX 2.1
+# REMIX 3
 
-REMIX is a CLI-only Android/ARM64 reverse-engineering correlation engine. It is intentionally **not** a collection of aliases around JADX, Rizin, Frida or Ghidra. Those engines contribute evidence to one normalized model so a native function can be queried once and show its offsets, symbols, callers/callees, all xrefs, strings, JNI bindings, imports, PLT/GOT slots, relocations, ARM64 control-flow profile, Java-side seams and runtime observations together.
+REMIX is a CLI-only reverse-engineering control plane for Android and ARM64/native targets. It keeps a single evidence model across static analysis, Android/Dex analysis, runtime observation, cross-engine validation, graph slicing, and binary matching.
 
-The previous orchestration approach paid startup cost repeatedly and could finish with independent `jni`, `plt`, or hook logs that still had to be reconciled manually. REMIX instead performs bulk extraction once per ELF, correlates in-process, ranks functions, then spends expensive decompilation or live-hook time only on selected targets.
+The core design rule is **route first, analyze second, validate third**. REMIX does not blindly run every installed tool. Cheap fingerprinting determines the target shape, selectors reduce the search space, expensive engines only receive high-value functions, and independent engine families are tracked separately when calculating consensus.
 
-## Engines that feed the same evidence graph
+## What V3 adds
 
-- **Rizin**: bulk function discovery, global xrefs, strings, symbols, imports, relocations and sections in one analysis process per ELF; targeted `pdf`/`pdc`/ARM64/basic-block work only for ranked functions.
-- **LIEF**: independent loader truth: `DT_NEEDED`, PIE/RELRO/NX/RWX segments, constructors/destructors, dynamic entries, dynamic symbols, demangled C++ names, RTTI/vtables, relocations and PLT/GOT slots.
-- **JADX + raw DEX strings**: Java methods, native declarations, `System.loadLibrary`, semantic strings and conservative Java call edges.
-- **Root `/proc`**: clean-process status, maps, threads, file descriptors, sockets, mount namespace, runtime module bases and suspicious executable-memory mappings without injecting anything.
-- **Frida** (explicit only): `RegisterNatives`, module loads, exact `module+offset` hooks, imports/exports, arguments, return values and backtraces. Runtime pointers are normalized back to the static function records.
-- **Ghidra headless** (optional): independent targeted second-opinion decompilation for only the highest-ranked offsets.
+V3 keeps all V2.1 commands (`doctor`, `analyze`, `fn`, `query`, `graph`, `module`, `refs`, `symbols`, `strings`, `jni`, `path`, `trace`, `diff`) and adds:
 
-Evidence classes remain distinct. Root-only observations are not relabeled as instrumented results, and Frida observations are not treated as stock/clean-process facts.
+- `fingerprint` — fast pre-decompile routing for APK/XAPK/DEX structure, frameworks, HTTP stacks, DI/serialization, native ABIs, split APKs, obfuscation signals and protection signals.
+- `engines` — capability registry and availability/version discovery for static, dynamic, symbolic, emulation, Android and decompiler backends.
+- `select` — safe expression language over the function evidence model.
+- `slice` — caller/callee/xref neighborhood extraction with semantic filtering.
+- `validate` — independent-family function validation and weighted consensus.
+- `flow` — composable named datasets: select → filter → expand → enrich → validate → consensus → scan → external → assert → emit.
+- `auto` — bounded autonomous high-signal plan generated from the available local engines.
+- `decompile` — controlled jadx/Vineflower dual-decompiler lane.
+- `kotlin-names` — Kotlin metadata-assisted recovery of useful names in R8-heavy source output.
+- `sig` / `match` — fuzzy function signatures for cross-version matching when names/addresses move.
+- `recipe` — reusable deep-analysis plans.
+
+No GUI is required.
 
 ## Install
 
 ```bash
 cd REMIX
-chmod +x INSTALL.command VERIFY.command
+chmod +x VERIFY.command INSTALL.command
 ./VERIFY.command
 ./INSTALL.command
-source ~/AndroidCTFMax/env.sh 2>/dev/null || true
-rehash 2>/dev/null || true
-remix doctor --serial emulator-5554
+
+remix --version
+remix engines --available
 ```
 
-## One-line autonomous runs
-
-Fast static + clean root runtime baseline:
+## Fast autonomous run
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode fast --budget 90 --jobs 4 --live-root
+remix auto \
+  --package com.example.target \
+  --serial emulator-5554 \
+  --mode balanced \
+  --analysis-budget 90 \
+  --budget 240 \
+  --jobs 4
 ```
 
-Full correlated static pass:
+For an APK without a live device:
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode full --budget 240 --jobs 4 --live-root --focus auth,jni,tls,integrity --ghidra-top 8
+remix auto \
+  --apk ./target.apk \
+  --mode full \
+  --analysis-budget 120 \
+  --budget 300 \
+  --deep-validators
 ```
 
-Full pass plus explicit dynamic correlation of the top ranked functions:
+`--deep-validators` enables expensive validators such as angr only when they are actually installed.
+
+## Phase-0 fingerprinting
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode full --budget 300 --jobs 4 --live-root --focus auth,jni,tls,integrity --instrument --trace-top 10 --instrument-duration 18 --frida-prefer stock
+remix fingerprint --apk ./target.apk
+remix fingerprint --apk ./target.apk --json > fingerprint.json
 ```
 
-Exact offset instrumentation can be combined with semantic hooks:
+The router looks for framework markers (native Java/Kotlin, Compose, Flutter, React Native/Hermes, Cordova/Capacitor, Xamarin/.NET, Unity), network stacks (OkHttp, Retrofit, Ktor, Apollo, Volley, Cronet/HttpEngine, gRPC, WebView), DI/serialization signals, native libraries and ABIs, split APKs, protection markers and a bounded obfuscation heuristic. If APKiD is present it is used as an additional independent packer/compiler/protector source.
+
+## Function selector language
+
+Selectors work against the normalized function model, not raw grep output:
 
 ```bash
-remix analyze --package com.vcamor.vv --serial emulator-5554 --mode full --budget 300 --live-root --instrument --offset-hook 'libsecrets.so@0x42fdc:n8' --offset-hook 'libsecrets.so@0x435c8:n23' --hook RegisterNatives --hook SSL_write --hook connect
+remix select --case CASE --where 'tag:crypto AND score>=6'
+remix select --case CASE --where 'name~verify AND arm64.indirect_call>0'
+remix select --case CASE --where '(tag:integrity OR tag:antidebug) AND size>32'
+remix select --case CASE --where 'imports~SSL_ AND NOT tag:storage' --json
 ```
 
-## Manual RE surface
+Fields include `score`, `size`, `offset`, `address`, `name`, `module`, `tags`, `imports`, `symbols`, `jni`, `callers`, `callees`, `strings`, `dynamic_hits`, `evidence_count`, and `arm64.<metric>`.
 
-All commands below query the **same case model** rather than launching separate analysis stacks:
+## Slice a topology
 
 ```bash
-remix query   --case ~/AndroidCTFMax/cases-remix/CASE --tag auth --tag jni --min-score 3 --limit 60
-remix fn      --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --offset 0x42fdc
-remix refs    --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --offset 0x42fdc --direction both --limit 200
-remix symbols --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --contains signer --limit 100
-remix strings --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --tag integrity --with-refs --limit 100
-remix jni     --case ~/AndroidCTFMax/cases-remix/CASE --contains 'n8'
-remix module  --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --limit 40
-remix graph   --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --offset 0x42fdc --depth 4 --direction both
-remix path    --case ~/AndroidCTFMax/cases-remix/CASE --module libsecrets.so --from 0x42fdc --to 0x435c8
-remix trace   --case ~/AndroidCTFMax/cases-remix/CASE --serial emulator-5554 --duration 18 --offset-hook 'libsecrets.so@0x42fdc:n8' --hook RegisterNatives --hook SSL_write
-remix diff    --left ~/AndroidCTFMax/cases-remix/CASE_A --right ~/AndroidCTFMax/cases-remix/CASE_B --verbose
+remix slice \
+  --case CASE \
+  --where 'tag:jni OR tag:loader' \
+  --direction both \
+  --depth 2 \
+  --filter 'score>=2' \
+  --limit 300
 ```
 
-A `fn` dossier includes:
+This keeps native calls and non-call xref neighborhoods useful for stripped ARM64 code, where tables, GOT entries, strings and function pointers often matter more than exported names.
+
+## Cross-engine validation
+
+```bash
+remix validate \
+  --case CASE \
+  --where 'tag:integrity AND score>=5' \
+  --engine rizin \
+  --engine lief \
+  --engine radare2 \
+  --engine ghidra \
+  --engine angr \
+  --limit 12 \
+  --policy weighted \
+  --json
+```
+
+REMIX records engine families as well as engine names. Agreement from unrelated analysis families is weighted more strongly than several outputs derived from the same parser lineage. Missing optional engines are explicit; they are never counted as evidence.
+
+## Composable flows
+
+A flow operates on named datasets. Each stage can consume the result of an earlier stage.
+
+```bash
+remix flow \
+  --case CASE \
+  --step 'id=hot;op=select;where=tag:crypto AND score>=6;limit=40' \
+  --step 'id=near;op=expand;from=hot;direction=both;depth=1;limit=120' \
+  --step 'id=rz;op=enrich;engine=rizin;from=near;limit=32' \
+  --step 'id=check;op=validate;from=hot;engines=rizin,lief,radare2,ghidra;limit=20' \
+  --step 'id=vote;op=consensus;from=check;policy=weighted' \
+  --step 'id=strong;op=filter;from=vote;criteria={"score":{"gte":0.75}}' \
+  --step 'id=out;op=emit;from=strong;format=json'
+```
+
+For complex flows, use a JSON plan:
+
+```bash
+remix flow --case CASE --plan examples/flows/consensus.json
+```
+
+### Feeding one tool's result into another
+
+`external` stages accept an argv array, never an interpolated shell command. They can run once per selected function and support `${module_path}`, `${offset}`, `${address}`, `${end}`, `${size}`, `${name}`, `${case}`, `${out}` placeholders.
+
+Example plan fragment:
+
+```json
+{
+  "id": "objdump",
+  "op": "external",
+  "from": "hot",
+  "foreach": true,
+  "argv": ["llvm-objdump", "-d", "--start-address=${address}", "--stop-address=${end}", "${module_path}"],
+  "parser": "text",
+  "timeout": 15
+}
+```
+
+The returned records can then be filtered, projected, asserted, emitted, or passed into another external stage. Every stage records elapsed time, input/output cardinality, engine version/family where known, and errors in `flow/flow.json`.
+
+## Recipes
+
+```bash
+remix recipe list
+remix recipe show native-hard
+
+remix flow --case CASE --recipe native-hard
+remix flow --case CASE --recipe jni-bridge
+remix flow --case CASE --recipe network-tls
+remix flow --case CASE --recipe integrity-antidebug
+remix flow --case CASE --recipe deep-consensus
+```
+
+## Dual decompiler and Kotlin recovery
+
+```bash
+remix decompile ./target.apk --out ./dec --engine both --threads 4
+remix kotlin-names --sources ./dec/jadx/sources --out ./dec/kotlin-names
+```
+
+The dual lane is explicit: jadx remains the Android-first decompiler; Vineflower is a second opinion for JVM output when available. APK/DEX → Vineflower requires dex2jar.
+
+## Function signatures and cross-build matching
+
+```bash
+remix sig \
+  --case OLD_CASE \
+  --where 'tag:crypto AND score>=6' \
+  --limit 1 \
+  --out crypto-worker.json
+
+remix match \
+  --signature crypto-worker.json \
+  --case NEW_CASE \
+  --threshold 0.70
+```
+
+Signatures intentionally avoid raw address/name dependence. They combine size, graph degree, semantic tags, imported APIs, normalized referenced strings and ARM64 instruction profile.
+
+## Engine model
+
+```bash
+remix engines --available --verbose
+remix engines --capability symbolic
+remix engines --capability decompile
+remix engines --capability runtime
+```
+
+The registry knows about Rizin, radare2, Ghidra headless, LIEF, Capstone, Unicorn, angr, Qiling, Triton, Miasm, Z3, Keystone, jadx, Vineflower, dex2jar, apktool, baksmali, APKiD, Androguard, capa, FLOSS, Frida, r2frida, LLVM tools, RetDec and framework-specific helpers. Registry presence is not equivalent to installation: `engines` reports the actual local state.
+
+REMIX does not vendor these projects. Optional third-party engines retain their own licenses and are invoked only when present.
+
+## Evidence discipline
+
+REMIX distinguishes:
+
+- static evidence,
+- clean/root-observed runtime evidence,
+- instrumented runtime evidence,
+- decompiler-derived approximations,
+- cross-engine validation.
+
+An instrumented observation is not silently promoted to clean behavior. An unavailable engine is not a failed target. A heuristic fingerprint is not represented as proof. Cross-engine conflicts are retained in the result instead of being averaged away.
+
+## Outputs
+
+A case can contain:
 
 ```text
-module / SHA-256
-static VA / module-relative offset / runtime normalized address hits
-function name + symbol aliases + demangled names
-size / callers / callees
-incoming + outgoing code/data/call/string/import xrefs
-referenced strings + semantic keyword classes
-imports reached from the function
-PLT/GOT and relocation evidence
-static exported JNI and dynamic RegisterNatives mappings
-ARM64 instruction count + direct/indirect calls + branches + CFG complexity
-PAC/AUT + BTI + SVC + ADRP + load/store/compare profile
-dynamic calls/arguments/returns/backtraces when explicitly instrumented
-Rizin pseudocode/disassembly when selected
-Ghidra second-opinion evidence when requested
-source + confidence annotations
+case.json              normalized full evidence model
+case.sqlite            queryable index
+functions.jsonl        one dossier per function
+topology.dot           graph export
+REPORT.md              human summary
+artifact/              acquired inputs
+live-root/             clean root observation
+live-frida/            explicit instrumented evidence
+flow/flow.json         pipeline provenance
+flow/*.json            named flow outputs
+ghidra/                targeted headless enrichment
 ```
 
-## Topology and mechanism inference
-
-REMIX emits more than a flat function list. It builds:
-
-- native call edges;
-- non-call code/data/string/import xrefs;
-- approximate Java call edges, explicitly confidence-labeled;
-- Java→native JNI edges from exported JNI names and observed `RegisterNatives`;
-- import-call edges;
-- constructor/destructor lifecycle anchors;
-- PLT/GOT relocation topology;
-- C++ RTTI/vtable candidates;
-- semantic category subgraphs with probable roots, hubs and sinks;
-- implementation fingerprints such as native TLS, POSIX networking, dynamic loading, filesystem state and JNI registration.
-
-Semantic classes currently include `jni`, `loader`, `tls`, `network`, `crypto`, `integrity`, `antidebug`, `root`, `ipc`, `storage`, `auth`, and `camera`. A semantic tag is a ranking signal, not proof that the function implements the behavior.
-
-## ARM64 specifics
-
-For ranked functions REMIX records direct `bl`, indirect `blr`, `br`, conditional branches, returns, `svc`, PAC/AUT, BTI, ADRP, load/store and compare instructions. Basic-block edges provide an approximate cyclomatic-complexity signal. Bulk global xrefs remain the authoritative static relation source; the instruction profile is supporting evidence.
-
-## Root runtime memory
-
-A clean root snapshot records `/proc/<pid>/maps`, status, thread names, FDs, sockets and mountinfo. It also creates `live-root/memory_anomalies.json` for executable anonymous/memfd mappings, deleted mappings, W+X regions and executable code under unusual writable paths. This is useful for protected/custom loaders before choosing an instrumentation route.
-
-## Runtime exact-offset loop
-
-`--offset-hook MODULE@0xOFFSET[:label]` hooks `module.base + OFFSET` after ASLR is known. Late `dlopen` events refresh the module inventory and retry requested offset hooks. Call events capture pointer-valued arguments, return address and backtrace; return events capture the return value. These hits are then mapped back into the same static function dossier.
-
-`--trace-top N` closes the automatic loop:
-
-```text
-bulk static index
-  → correlate xrefs/JNI/strings/imports
-  → semantic rank
-  → select N functions
-  → exact module+offset runtime hooks
-  → ASLR-normalize hits/backtraces
-  → enrich original function dossiers
-```
-
-## Performance model
-
-- `fast`: Rizin `aa`, raw DEX semantic strings and optional clean root runtime map; no default decompilation.
-- `balanced`: fast index + six targeted high-value function dossiers.
-- `full`: deeper Rizin analysis + JADX semantic source index + sixteen targeted dossiers.
-- `deep`: deeper analysis + thirty-two targeted dossiers.
-
-Native bulk results are cached by SHA-256 + REMIX version + mode under `~/.cache/remix/`. Unchanged libraries are not re-analyzed on subsequent cases.
-
-`--budget N` bounds subprocess stage timeouts and prevents new expensive stages from starting once the budget is exhausted. Parallel workers already in flight can finish or hit their individually clamped timeout, so the budget is a practical wall-time bound rather than a claim of single-millisecond hard scheduling.
-
-## Case artifacts
-
-```text
-REPORT.md          ranked human report + mechanism/flow/module topology
-case.json          complete normalized evidence model
-case.sqlite        functions, strings, symbols, imports, JNI, xrefs, relocations, Java and edges
-functions.jsonl    one function dossier per line
-topology.dot       native call/JNI topology
-artifact/          acquired APK/DEX/native inputs
-java/              JADX output when enabled
-live-root/         clean root observation
-live-frida/        explicit instrumented observations
-```
-
-Useful SQL examples:
-
-```bash
-sqlite3 case.sqlite 'select module,printf("0x%x",offset),name,score,tags from functions order by score desc limit 50;'
-sqlite3 case.sqlite 'select module,printf("0x%x",src_function),type,to_symbol,to_import,to_string from xrefs where to_string like "%token%";'
-sqlite3 case.sqlite 'select module,name,demangled,printf("0x%x",address),type from symbols where name like "%JNI%" or demangled like "%verify%";'
-sqlite3 case.sqlite 'select module,java_class,java_method,signature,printf("0x%x",native_offset),source from jni;'
-```
-
-## CI and scope
-
-GitHub Actions validates syntax, unit tests and CLI smoke on Ubuntu and macOS with Python 3.11 and 3.13. Hosted CI cannot reproduce the KernelSU Android 16 AVD, so root/ADB/Frida route qualification remains an on-lab check.
-
-No RE framework can truthfully guarantee that every obfuscated/virtualized/self-modifying target will be recovered without ambiguity. REMIX therefore records source and confidence, keeps conflicting engine evidence instead of hiding it, uses bounded fallbacks, and exposes raw addresses/xrefs so uncertain results can be checked manually.
+See `docs/ARCHITECTURE.md` for the V3 control-plane design.
