@@ -1,0 +1,30 @@
+name: Apply REMIX V3.0.1 patch
+on:
+  push:
+    branches: [v3.0.1-resilient-baseline]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: ${{ github.event.head_commit.message == 'Stage V3.0.1 source patch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Apply verified patch
+        run: python .v301_apply.py
+      - name: Verify patched source
+        run: |
+          python -m compileall -q remix tests
+          python -m unittest discover -v tests
+          test "$(python -m remix --version)" = "REMIX 3.0.1"
+          python -m remix engines --no-version | grep portable-elf
+      - name: Commit source changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md docs/ARCHITECTURE.md pyproject.toml remix tests
+          git commit -m 'REMIX V3.0.1 resilient native baseline'
+          git push
