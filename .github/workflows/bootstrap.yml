@@ -1,54 +1,10 @@
 name: Bootstrap REMIX V3 source
 on:
-  push:
-    branches: [v3-nextlevel]
+  workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
-  bootstrap:
-    if: ${{ !contains(github.event.head_commit.message, 'REMIX V3 generated source') }}
+  frozen:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Verify source payload
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import base64, hashlib
-          parts=sorted(Path('bootstrap_payload').glob('*.b64'))
-          s=''.join(p.read_text().strip() for p in parts)
-          raw=base64.b64decode(s, validate=True)
-          got=hashlib.sha256(raw).hexdigest()
-          expected='805476b9e0005167d1e732304486dcda57482191a477cf51a63befe7be0fa8dd'
-          print('payload_parts=',len(parts),'base64_chars=',len(s),'archive_sha256=',got)
-          if len(parts)!=6 or got!=expected:
-              raise SystemExit('V3 payload verification failed')
-          PY
-      - name: Expand source
-        run: python bootstrap_repo.py
-      - name: Verify generated V3
-        run: |
-          python -m compileall -q remix tests
-          python -m unittest discover -v tests
-          test "$(python -m remix --version)" = "REMIX 3.0.0"
-          python -m remix engines --no-version >/dev/null
-          python -m remix recipe list >/dev/null
-          python -m remix select --help >/dev/null
-          python -m remix flow --help >/dev/null
-          python -m remix validate --help >/dev/null
-          python -m remix decompile --help >/dev/null
-          python -m remix kotlin-names --help >/dev/null
-      - name: Commit generated source
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add README.md LICENSE INSTALL.command VERIFY.command pyproject.toml remix tests ghidra_scripts docs examples
-          if git diff --cached --quiet; then
-            echo 'No generated source changes.'
-            exit 0
-          fi
-          git commit -m 'REMIX V3 generated source'
-          git push
+      - run: echo "REMIX V3 source bootstrap is frozen; source is committed directly."
