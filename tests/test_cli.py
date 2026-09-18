@@ -10,6 +10,11 @@ class CLITests(unittest.TestCase):
         self.assertIn("analyze", cp.stdout)
         self.assertIn("trace", cp.stdout)
         self.assertIn("fn", cp.stdout)
+        self.assertIn("refs", cp.stdout)
+        self.assertIn("symbols", cp.stdout)
+        self.assertIn("strings", cp.stdout)
+        self.assertIn("jni", cp.stdout)
+        self.assertIn("path", cp.stdout)
 
 
 if __name__ == "__main__":

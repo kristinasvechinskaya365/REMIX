@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remix-re"
-version = "2.1.0"
+version = "3.0.0"
 description = "Correlated Android/ARM64 reverse-engineering engine"
 requires-python = ">=3.11"
 authors = [{name="REMIX CTF Lab"}]
@@ -12,7 +12,7 @@ license = {text="MIT"}
 dependencies = []
 
 [project.scripts]
-remix = "remix.cli:main"
+remix = "remix.v3cli:main"
 
 [tool.setuptools.packages.find]
 include = ["remix*"]

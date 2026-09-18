@@ -45,8 +45,12 @@ class SymbolRef:
     size: int = 0
     bind: str = ""
     type: str = ""
+    visibility: str = ""
+    demangled: str = ""
+    section: str = ""
     imported: bool = False
     exported: bool = False
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -59,6 +63,8 @@ class FunctionNode:
     end: int = 0
     callers: list[int] = field(default_factory=list)
     callees: list[int] = field(default_factory=list)
+    xrefs_from: list[dict[str, Any]] = field(default_factory=list)
+    xrefs_to: list[dict[str, Any]] = field(default_factory=list)
     string_refs: list[int] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     symbols: list[str] = field(default_factory=list)

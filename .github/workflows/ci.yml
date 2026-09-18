@@ -24,3 +24,10 @@ jobs:
         run: |
           python -m remix --version
           python -m remix --help
+          python -m remix engines --no-version
+          python -m remix recipe list
+          python -m remix select --help
+          python -m remix flow --help
+          python -m remix validate --help
+          python -m remix decompile --help
+          python -m remix kotlin-names --help
