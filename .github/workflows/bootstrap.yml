@@ -21,7 +21,7 @@ jobs:
           python -m unittest discover -v tests
           python -m remix --version
           python -m remix engines >/dev/null
-          python -m remix recipe --list >/dev/null
+          python -m remix recipe list >/dev/null
       - name: Commit generated source
         run: |
           git config user.name 'github-actions[bot]'
